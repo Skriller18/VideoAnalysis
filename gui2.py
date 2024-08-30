@@ -1,5 +1,4 @@
 import streamlit as st
-import torch
 import cv2
 import numpy as np
 import tempfile
@@ -9,6 +8,9 @@ from pydub import AudioSegment
 import whisper
 from PIL import Image
 import io
+import torch
+import sounddevice as sd
+import wave
 
 cuda_available = torch.cuda.is_available()
 device = torch.device("cuda" if cuda_available else "cpu")
@@ -62,9 +64,9 @@ class AudioProcessor:
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization", use_auth_token="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")
         self.pipeline.to(device)
-        self.model = whisper.load_model("small.en", device=device)
+        self.model = whisper.load_model("small", device=device)
 
-    def process_audio(self, audio_path):
+    def process_audio(self, audio_path, language):
         audio = AudioSegment.from_file(audio_path)
         audio.export("processed_audio.wav", format="wav")
 
@@ -80,52 +82,87 @@ class AudioProcessor:
 
             segment = audio[start:end]
             segment.export("segment.wav", format="wav")
-            result = self.model.transcribe("segment.wav")
+            result = self.model.transcribe("segment.wav", language=language)
             
             transcript.append(f"Speaker {speaker}: {result['text']}")
 
         return "\n".join(transcript)
 
+def record_audio(duration=5, sample_rate=16000):
+    st.write("Recording...")
+    recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype="int16")
+    sd.wait()
+    st.write("Recording finished.")
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
+        wavefile = wave.open(temp_audio_file.name, 'wb')
+        wavefile.setnchannels(1)
+        wavefile.setsampwidth(2)
+        wavefile.setframerate(sample_rate)
+        wavefile.writeframes(recording.tobytes())
+        wavefile.close()
+        return temp_audio_file.name
+
 def main():
     st.title("Video and Audio Processor")
 
-    # Upload video file
-    video_file = st.file_uploader("Upload Video", type=["mp4", "avi"])
-    if video_file:
-        # Save the uploaded video to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
-            temp_video_file.write(video_file.read())
-            temp_video_path = temp_video_file.name
+    video_capture = None
+    audio_path = None
 
-        # Use OpenCV to process the video
-        video_capture = cv2.VideoCapture(temp_video_path)
+    # Video Source Selection
+    video_source = st.radio("Select Video Source", ("Upload Video", "Use Webcam"))
+    
+    if video_source == "Upload Video":
+        video_file = st.file_uploader("Upload Video", type=["mp4", "avi"])
+        if video_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
+                temp_video_file.write(video_file.read())
+                temp_video_path = temp_video_file.name
+            video_capture = cv2.VideoCapture(temp_video_path)
+    else:
+        video_capture = cv2.VideoCapture(0)
+    
+    if video_capture is not None and video_capture.isOpened():
         known_face_encodings = np.load('encodings.npy')
         with open('string_array.txt', 'r') as file:
             known_face_names = [line.strip() for line in file]
 
         video_processor = VideoProcessor(known_face_encodings, known_face_names)
 
-        st.video(temp_video_path)
-
-        ret, frame = video_capture.read()
-        if ret:
+        stframe = st.empty()
+        while True:
+            ret, frame = video_capture.read()
+            if not ret:
+                break
             processed_frame = video_processor.process_frame(frame)
             _, buffer = cv2.imencode('.jpg', processed_frame)
             image = Image.open(io.BytesIO(buffer))
-            st.image(image, caption="Processed Frame", use_column_width=True)
-
+            stframe.image(image, caption="Processed Frame", use_column_width=True)
+        
         video_capture.release()
 
-    # Upload audio file
-    audio_file = st.file_uploader("Upload Audio", type=["wav", "mp3"])
-    if audio_file:
-        st.audio(audio_file, format='audio/wav')
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
-            temp_audio_file.write(audio_file.read())
-            audio_path = temp_audio_file.name
-        
+    # Audio Source Selection
+    audio_source = st.radio("Select Audio Source", ("Upload Audio", "Record Audio"))
+    
+    if audio_source == "Upload Audio":
+        audio_file = st.file_uploader("Upload Audio", type=["wav", "mp3"])
+        if audio_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
+                temp_audio_file.write(audio_file.read())
+                audio_path = temp_audio_file.name
+    elif audio_source == "Record Audio":
+        duration = st.slider("Recording Duration (seconds)", 1, 10, 5)
+        if st.button("Start Recording"):
+            audio_path = record_audio(duration)
+
+    if audio_path:
+        st.audio(audio_path, format='audio/wav')
+
+        language_option = st.selectbox("Select Language", ["English", "Hindi"])
+        language_code = "hi" if language_option == "Hindi" else "en"
+
         audio_processor = AudioProcessor()
-        transcript = audio_processor.process_audio(audio_path)
+        transcript = audio_processor.process_audio(audio_path, language_code)
         st.text_area("Transcript", transcript, height=300)
 
 if __name__ == "__main__":
